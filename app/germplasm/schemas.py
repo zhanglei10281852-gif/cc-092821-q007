@@ -176,6 +176,47 @@ class HoldCreate(BaseModel):
     actor: str = Field(min_length=1, max_length=100)
 
 
+class SplitTarget(BaseModel):
+    lot_no: str = Field(min_length=3, max_length=60)
+    weight_grams: float = Field(gt=0, le=10_000_000)
+    moisture_percent: float | None = Field(default=None, ge=0, le=100)
+    sealed_on: date | None = None
+
+    @field_validator("lot_no")
+    @classmethod
+    def normalize_lot_no(cls, value: str) -> str:
+        return value.strip().upper()
+
+
+class SplitRequest(BaseModel):
+    source_lot_id: int = Field(gt=0)
+    expected_version: int = Field(gt=0)
+    targets: list[SplitTarget] = Field(min_length=1, max_length=100)
+    business_key: str = Field(min_length=8, max_length=100)
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(default="", max_length=500)
+
+
+class MergeSource(BaseModel):
+    lot_id: int = Field(gt=0)
+    weight_grams: float = Field(gt=0, le=10_000_000)
+    expected_version: int = Field(gt=0)
+
+
+class MergeRequest(BaseModel):
+    sources: list[MergeSource] = Field(min_length=2, max_length=100)
+    target_lot_no: str = Field(min_length=3, max_length=60)
+    moisture_percent: float | None = Field(default=None, ge=0, le=100)
+    business_key: str = Field(min_length=8, max_length=100)
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(default="", max_length=500)
+
+    @field_validator("target_lot_no")
+    @classmethod
+    def normalize_target_lot_no(cls, value: str) -> str:
+        return value.strip().upper()
+
+
 class HoldRelease(BaseModel):
     reason: str = Field(min_length=2, max_length=500)
     actor: str = Field(min_length=1, max_length=100)

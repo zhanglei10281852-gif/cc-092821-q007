@@ -5,6 +5,7 @@ from typing import Any
 
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, ValidationError
+from app.germplasm.lineage import LineageService
 from app.germplasm.repository import GermplasmRepository, record
 
 
@@ -13,6 +14,7 @@ class InventoryService:
         self.connection = connection
         self.clock = clock or SystemClock()
         self.repository = GermplasmRepository(connection)
+        self.lineage = LineageService(connection, self.clock)
 
     def create_location(self, data: dict[str, Any]) -> dict[str, Any]:
         timestamp = to_storage(self.clock.now())
@@ -161,24 +163,39 @@ class InventoryService:
         holds = self.repository.active_holds(int(lot["id"]))
         if holds:
             raise ConflictError("批次存在未解除的质量或权限冻结", context={"holds": [item["id"] for item in holds]})
-        quantity = float(data["quantity_grams"])
+        quantity = round(float(data["quantity_grams"]), 6)
+        if quantity <= 0:
+            raise ValidationError("领用重量必须大于 0")
         if quantity > float(lot["available_weight_grams"]) + 1e-9:
             raise ConflictError("批次可用重量不足")
         timestamp = to_storage(self.clock.now())
         remaining = round(float(lot["available_weight_grams"]) - quantity, 6)
-        status = "depleted" if remaining <= 1e-9 else lot["status"]
-        self.connection.execute(
-            "UPDATE seed_lots SET available_weight_grams=?,status=?,version=version+1,updated_at=? WHERE id=?",
-            (remaining, status, timestamp, lot["id"]),
-        )
+        # 条件扣减：余额不足时不会写入；在 IMMEDIATE 事务中配合业务键，重试不会造成第二次增减
         cursor = self.connection.execute(
+            "UPDATE seed_lots SET available_weight_grams=?,status=?,version=version+1,updated_at=? "
+            "WHERE id=? AND available_weight_grams>=?",
+            (remaining, "depleted" if remaining <= 1e-9 else lot["status"], timestamp, lot["id"], quantity - 1e-9),
+        )
+        if cursor.rowcount != 1:
+            raise ConflictError("批次可用重量不足，领用未执行")
+        movement_cursor = self.connection.execute(
             "INSERT INTO lot_movements(lot_id,movement_type,quantity_grams,idempotency_key,actor,reason,created_at) "
             "VALUES(?,?,?,?,?,?,?)",
             (lot["id"], data["movement_type"], -quantity, data["idempotency_key"], data["actor"], data["reason"], timestamp),
         )
+        movement = record(self.connection.execute(
+            "SELECT * FROM lot_movements WHERE id=?", (movement_cursor.lastrowid,)
+        ).fetchone())
+        # 同事务登记不可变谱系消耗，保证普通流水都能在谱系账本中找到对应记录
+        event = self.lineage.record_consumption(
+            lot_id=int(lot["id"]), weight_grams=quantity, movement_type=data["movement_type"],
+            business_key=data["idempotency_key"], actor=data["actor"], reason=data["reason"],
+            balance_after_grams=remaining, placement_id=None,
+        )
         return {
             "lot": self.repository.lot_detail(int(lot["id"])),
-            "movement": record(self.connection.execute("SELECT * FROM lot_movements WHERE id=?", (cursor.lastrowid,)).fetchone()),
+            "movement": movement,
+            "lineage_event": event,
             "replayed": False,
         }
 
@@ -224,7 +241,8 @@ class InventoryService:
     def reconcile(self, lot_id: int) -> dict[str, Any]:
         lot = self.repository.require_lot(lot_id)
         movement_total = float(self.connection.execute(
-            "SELECT COALESCE(SUM(quantity_grams),0) FROM lot_movements WHERE lot_id=? AND movement_type IN ('取样','领用','报废','归还','盘点调整')",
+            "SELECT COALESCE(SUM(quantity_grams),0) FROM lot_movements WHERE lot_id=? "
+            "AND movement_type IN ('取样','领用','报废','归还','盘点调整','分装','合并')",
             (lot_id,),
         ).fetchone()[0])
         expected_available = round(float(lot["initial_weight_grams"]) + movement_total, 6)

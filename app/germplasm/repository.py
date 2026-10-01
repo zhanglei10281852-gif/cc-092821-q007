@@ -206,6 +206,7 @@ class GermplasmRepository:
         allowed = {
             "accessions", "seed_lots", "storage_locations", "viability_tests",
             "retest_schedules", "quality_alerts", "distribution_requests",
+            "lineage_events", "lineage_ledger_entries",
         }
         if table not in allowed:
             raise ValueError("不允许统计该数据表")

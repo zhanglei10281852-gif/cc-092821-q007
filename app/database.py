@@ -223,7 +223,7 @@ CREATE TABLE IF NOT EXISTS lot_movements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,
     placement_id INTEGER REFERENCES lot_placements(id),
-    movement_type TEXT NOT NULL CHECK(movement_type IN ('入库','移库','取样','领用','归还','报废','盘点调整')),
+    movement_type TEXT NOT NULL CHECK(movement_type IN ('入库','移库','取样','领用','归还','报废','盘点调整','分装','合并')),
     quantity_grams REAL NOT NULL,
     from_location_id INTEGER REFERENCES storage_locations(id),
     to_location_id INTEGER REFERENCES storage_locations(id),
@@ -392,6 +392,58 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_events(status,available_at,id);
+
+CREATE TABLE IF NOT EXISTS lineage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL CHECK(event_type IN ('分装','合并','取样','领用','报废')),
+    business_key TEXT NOT NULL UNIQUE,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    compatibility_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'committed' CHECK(status IN ('committed')),
+    occurred_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_events_time ON lineage_events(occurred_at,id);
+CREATE TABLE IF NOT EXISTS lineage_ledger_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES lineage_events(id) ON DELETE RESTRICT,
+    seq INTEGER NOT NULL CHECK(seq >= 0),
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE RESTRICT,
+    role TEXT NOT NULL CHECK(role IN ('source','product','consumption')),
+    other_lot_id INTEGER REFERENCES seed_lots(id) ON DELETE RESTRICT,
+    movement_type TEXT NOT NULL,
+    weight_grams REAL NOT NULL CHECK(weight_grams >= 0),
+    placement_id INTEGER REFERENCES lot_placements(id) ON DELETE RESTRICT,
+    balance_after_grams REAL NOT NULL,
+    idempotency_key TEXT UNIQUE,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    occurred_at TEXT NOT NULL,
+    UNIQUE(event_id,seq),
+    UNIQUE(event_id,lot_id,role)
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_entries_lot ON lineage_ledger_entries(lot_id,id);
+CREATE INDEX IF NOT EXISTS idx_lineage_entries_event ON lineage_ledger_entries(event_id,seq);
+DROP TRIGGER IF EXISTS trg_lineage_events_no_update;
+CREATE TRIGGER trg_lineage_events_no_update BEFORE UPDATE ON lineage_events
+BEGIN
+    SELECT RAISE(ABORT,'lineage_events 为不可变谱系账本，禁止更新');
+END;
+DROP TRIGGER IF EXISTS trg_lineage_events_no_delete;
+CREATE TRIGGER trg_lineage_events_no_delete BEFORE DELETE ON lineage_events
+BEGIN
+    SELECT RAISE(ABORT,'lineage_events 为不可变谱系账本，禁止删除');
+END;
+DROP TRIGGER IF EXISTS trg_lineage_entries_no_update;
+CREATE TRIGGER trg_lineage_entries_no_update BEFORE UPDATE ON lineage_ledger_entries
+BEGIN
+    SELECT RAISE(ABORT,'lineage_ledger_entries 为不可变谱系流水，禁止更新');
+END;
+DROP TRIGGER IF EXISTS trg_lineage_entries_no_delete;
+CREATE TRIGGER trg_lineage_entries_no_delete BEFORE DELETE ON lineage_ledger_entries
+BEGIN
+    SELECT RAISE(ABORT,'lineage_ledger_entries 为不可变谱系流水，禁止删除');
+END;
 '''
 
 PERMISSIONS = [
@@ -407,6 +459,8 @@ PERMISSIONS = [
     ("accessions.write", "维护种质材料", "accessions", "write"),
     ("inventory.read", "查看库存", "inventory", "read"),
     ("inventory.write", "维护库存", "inventory", "write"),
+    ("lineage.read", "查看批次谱系", "lineage", "read"),
+    ("lineage.write", "执行分装合并", "lineage", "write"),
     ("viability.read", "查看活力检测", "viability", "read"),
     ("viability.write", "执行活力检测", "viability", "write"),
     ("quality.review", "复核质量结果", "quality", "review"),
@@ -468,10 +522,46 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+LOT_MOVEMENTS_MIGRATION = r'''
+PRAGMA foreign_keys=OFF;
+CREATE TABLE lot_movements_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,
+    placement_id INTEGER REFERENCES lot_placements(id),
+    movement_type TEXT NOT NULL CHECK(movement_type IN ('入库','移库','取样','领用','归还','报废','盘点调整','分装','合并')),
+    quantity_grams REAL NOT NULL,
+    from_location_id INTEGER REFERENCES storage_locations(id),
+    to_location_id INTEGER REFERENCES storage_locations(id),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+INSERT INTO lot_movements_new(id,lot_id,placement_id,movement_type,quantity_grams,from_location_id,to_location_id,
+    idempotency_key,actor,reason,created_at)
+SELECT id,lot_id,placement_id,movement_type,quantity_grams,from_location_id,to_location_id,
+    idempotency_key,actor,reason,created_at FROM lot_movements;
+DROP TABLE lot_movements;
+ALTER TABLE lot_movements_new RENAME TO lot_movements;
+CREATE INDEX IF NOT EXISTS idx_movements_lot ON lot_movements(lot_id,id);
+PRAGMA foreign_keys=ON;
+'''
+
+
+def _migrate_movement_types(connection: sqlite3.Connection) -> None:
+    """旧库的 lot_movements CHECK 不允许分装/合并，按 SQLite 规程重建该表。"""
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='lot_movements'"
+    ).fetchone()
+    if row and "'分装'" not in (row[0] or ""):
+        connection.executescript(LOT_MOVEMENTS_MIGRATION)
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _migrate_movement_types(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -495,10 +585,10 @@ def init_db() -> None:
             (administrator, timestamp),
         )
         role_permissions = {
-            "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write"],
-            "technician": ["accessions.read", "inventory.read", "viability.read", "viability.write"],
-            "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve"],
-            "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read"],
+            "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write", "lineage.read", "lineage.write"],
+            "technician": ["accessions.read", "inventory.read", "lineage.read", "viability.read", "viability.write"],
+            "curator": ["accessions.read", "inventory.read", "lineage.read", "viability.read", "quality.review", "distribution.approve"],
+            "auditor": ["accessions.read", "inventory.read", "lineage.read", "viability.read", "audit.read"],
         }
         for role_code, codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]

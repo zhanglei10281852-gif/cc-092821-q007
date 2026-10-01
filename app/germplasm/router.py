@@ -20,12 +20,14 @@ from app.germplasm.schemas import (
     HoldRelease,
     LocationCreate,
     LotCreate,
+    MergeRequest,
     MovePlacement,
     PlacementCreate,
     PolicyCreate,
     ProtocolCreate,
     ReadingCreate,
     SourceCreate,
+    SplitRequest,
     TestComplete,
     TestCreate,
     TestInvalidate,
@@ -189,6 +191,41 @@ def withdraw(data: WithdrawalCreate, principal: Principal = Depends(current_prin
     principal.require("inventory.write")
     with transaction(immediate=True) as connection:
         return GermplasmService(connection).inventory.withdraw(data.model_dump(mode="json"))
+
+
+@router.post("/lineage/splits", status_code=201)
+def split_lot(data: SplitRequest, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("lineage.write")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).lineage.split_lot(data.model_dump(mode="json"))
+
+
+@router.post("/lineage/merges", status_code=201)
+def merge_lots(data: MergeRequest, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("lineage.write")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).lineage.merge_lots(data.model_dump(mode="json"))
+
+
+@router.get("/lineage/events/{event_id}")
+def lineage_event_detail(event_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("lineage.read")
+    return _service().lineage.require_event(event_id)
+
+
+@router.get("/lots/{lot_id}/lineage")
+def lot_lineage(lot_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("lineage.read")
+    return _service().lineage.lot_lineage(lot_id)
+
+
+@router.get("/lineage/conservation")
+def lineage_conservation(
+    lot_id: int | None = Query(default=None, ge=1),
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("lineage.read")
+    return _service().lineage.conservation_check(lot_id)
 
 
 @router.post("/holds", status_code=201)
