@@ -12,6 +12,7 @@ JSON_COLUMNS = {
     "restrictions_json": "restrictions",
     "detail_json": "detail",
     "payload_json": "payload",
+    "snapshot_json": "snapshot",
 }
 
 
@@ -143,6 +144,76 @@ class GermplasmRepository:
     def movement_by_key(self, key: str) -> dict[str, Any] | None:
         return record(self.connection.execute("SELECT * FROM lot_movements WHERE idempotency_key=?", (key,)).fetchone())
 
+    def lineage_event_by_key(self, key: str) -> dict[str, Any] | None:
+        return record(self.connection.execute(
+            "SELECT * FROM lot_lineage_events WHERE event_key=?", (key,)
+        ).fetchone())
+
+    def lineage_components(self, event_id: int) -> list[dict[str, Any]]:
+        return records(self.connection.execute(
+            "SELECT * FROM lot_lineage_components WHERE event_id=? ORDER BY component_role,ordinal,id", (event_id,)
+        ).fetchall())
+
+    def latest_completed_viability(self, lot_id: int) -> dict[str, Any] | None:
+        return record(self.connection.execute(
+            "SELECT * FROM viability_tests WHERE lot_id=? AND status='completed' ORDER BY completed_at DESC,id DESC LIMIT 1",
+            (lot_id,),
+        ).fetchone())
+
+    def lineage_ancestors(self, lot_id: int) -> list[dict[str, Any]]:
+        """沿 output 事件 -> input 组件向上回溯来源，事件由近及远。"""
+        events: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        frontier = [lot_id]
+        while frontier:
+            placeholders = ",".join("?" for _ in frontier)
+            rows = self.connection.execute(
+                f"SELECT DISTINCT e.* FROM lot_lineage_events e "
+                f"JOIN lot_lineage_components c ON c.event_id=e.id AND c.component_role='output' "
+                f"WHERE c.lot_id IN ({placeholders}) ORDER BY e.id DESC",
+                frontier,
+            ).fetchall()
+            next_frontier: list[int] = []
+            for row in rows:
+                event = record(row)
+                if event["id"] in seen:
+                    continue
+                seen.add(event["id"])
+                event["components"] = self.lineage_components(int(event["id"]))
+                events.append(event)
+                for component in event["components"]:
+                    if component["component_role"] == "input":
+                        next_frontier.append(int(component["lot_id"]))
+            frontier = next_frontier
+        return events
+
+    def lineage_descendants(self, lot_id: int) -> list[dict[str, Any]]:
+        """沿 input 事件 -> output 组件向下展开去向，事件由远及近。"""
+        events: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        frontier = [lot_id]
+        while frontier:
+            placeholders = ",".join("?" for _ in frontier)
+            rows = self.connection.execute(
+                f"SELECT DISTINCT e.* FROM lot_lineage_events e "
+                f"JOIN lot_lineage_components c ON c.event_id=e.id AND c.component_role='input' "
+                f"WHERE c.lot_id IN ({placeholders}) ORDER BY e.id",
+                frontier,
+            ).fetchall()
+            next_frontier: list[int] = []
+            for row in rows:
+                event = record(row)
+                if event["id"] in seen:
+                    continue
+                seen.add(event["id"])
+                event["components"] = self.lineage_components(int(event["id"]))
+                events.append(event)
+                for component in event["components"]:
+                    if component["component_role"] == "output":
+                        next_frontier.append(int(component["lot_id"]))
+            frontier = next_frontier
+        return events
+
     def require_protocol(self, protocol_id: int) -> dict[str, Any]:
         item = record(self.connection.execute("SELECT * FROM viability_protocols WHERE id=?", (protocol_id,)).fetchone())
         if item is None:
@@ -206,6 +277,7 @@ class GermplasmRepository:
         allowed = {
             "accessions", "seed_lots", "storage_locations", "viability_tests",
             "retest_schedules", "quality_alerts", "distribution_requests",
+            "lot_lineage_events",
         }
         if table not in allowed:
             raise ValueError("不允许统计该数据表")

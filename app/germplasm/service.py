@@ -5,6 +5,7 @@ import sqlite3
 from app.core.clock import Clock
 from app.germplasm.accessions import AccessionService
 from app.germplasm.inventory import InventoryService
+from app.germplasm.lineage import LineageService
 from app.germplasm.quality import DistributionService, QualityService
 from app.germplasm.repository import GermplasmRepository
 from app.germplasm.viability import ViabilityService
@@ -18,6 +19,7 @@ class GermplasmService:
         self.repository = GermplasmRepository(connection)
         self.accessions = AccessionService(connection, clock)
         self.inventory = InventoryService(connection, clock)
+        self.lineage = LineageService(connection, clock)
         self.viability = ViabilityService(connection, clock)
         self.quality = QualityService(connection, clock)
         self.distribution = DistributionService(connection, clock)

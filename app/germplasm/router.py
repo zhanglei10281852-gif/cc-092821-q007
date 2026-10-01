@@ -20,12 +20,14 @@ from app.germplasm.schemas import (
     HoldRelease,
     LocationCreate,
     LotCreate,
+    MergeCreate,
     MovePlacement,
     PlacementCreate,
     PolicyCreate,
     ProtocolCreate,
     ReadingCreate,
     SourceCreate,
+    SplitCreate,
     TestComplete,
     TestCreate,
     TestInvalidate,
@@ -164,6 +166,38 @@ def lot_detail(lot_id: int, principal: Principal = Depends(current_principal)) -
 def reconcile_lot(lot_id: int, principal: Principal = Depends(current_principal)) -> dict:
     principal.require("inventory.read")
     return _service().inventory.reconcile(lot_id)
+
+
+@router.post("/lineage/splits", status_code=201)
+def split_lot(data: SplitCreate, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("inventory.write")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).lineage.split(data.model_dump(mode="json"))
+
+
+@router.post("/lineage/merges", status_code=201)
+def merge_lots(data: MergeCreate, prime: Principal = Depends(current_principal)) -> dict:
+    prime.require("inventory.write")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).lineage.merge(data.model_dump(mode="json"))
+
+
+@router.get("/lineage/events/{event_id}")
+def lineage_event(event_id: int, prime: Principal = Depends(current_principal)) -> dict:
+    prime.require("inventory.read")
+    return _service().lineage.event_detail(event_id)
+
+
+@router.get("/lots/{lot_id}/lineage")
+def lot_lineage(lot_id: int, prime: Principal = Depends(current_principal)) -> dict:
+    prime.require("inventory.read")
+    return _service().lineage.lineage_view(lot_id)
+
+
+@router.get("/lots/{lot_id}/conservation")
+def lot_conservation(lot_id: int, prime: Principal = Depends(current_principal)) -> dict:
+    prime.require("inventory.read")
+    return _service().lineage.conservation_check(lot_id)
 
 
 @router.post("/placements", status_code=201)

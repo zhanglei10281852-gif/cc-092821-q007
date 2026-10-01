@@ -223,16 +223,61 @@ CREATE TABLE IF NOT EXISTS lot_movements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,
     placement_id INTEGER REFERENCES lot_placements(id),
-    movement_type TEXT NOT NULL CHECK(movement_type IN ('入库','移库','取样','领用','归还','报废','盘点调整')),
+    movement_type TEXT NOT NULL CHECK(movement_type IN ('入库','移库','取样','领用','归还','报废','盘点调整','分装','合并')),
     quantity_grams REAL NOT NULL,
     from_location_id INTEGER REFERENCES storage_locations(id),
     to_location_id INTEGER REFERENCES storage_locations(id),
+    lineage_event_id INTEGER REFERENCES lot_lineage_events(id) ON DELETE RESTRICT,
     idempotency_key TEXT NOT NULL UNIQUE,
     actor TEXT NOT NULL,
     reason TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_movements_lot ON lot_movements(lot_id,id);
+CREATE TABLE IF NOT EXISTS lot_lineage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL CHECK(event_type IN ('origin','split','merge')),
+    source_lot_id INTEGER REFERENCES seed_lots(id) ON DELETE RESTRICT,
+    result_lot_id INTEGER REFERENCES seed_lots(id) ON DELETE RESTRICT,
+    total_weight_grams REAL NOT NULL CHECK(total_weight_grams >= 0),
+    snapshot_json TEXT NOT NULL DEFAULT '{}',
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_source ON lot_lineage_events(source_lot_id,id);
+CREATE INDEX IF NOT EXISTS idx_lineage_result ON lot_lineage_events(result_lot_id,id);
+CREATE TABLE IF NOT EXISTS lot_lineage_components (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES lot_lineage_events(id) ON DELETE RESTRICT,
+    component_role TEXT NOT NULL CHECK(component_role IN ('output','input')),
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE RESTRICT,
+    weight_grams REAL NOT NULL CHECK(weight_grams > 0),
+    ordinal INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(event_id,component_role,ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_components_lot ON lot_lineage_components(lot_id,id);
+CREATE TRIGGER IF NOT EXISTS trg_lineage_events_no_update
+BEFORE UPDATE ON lot_lineage_events
+BEGIN
+    SELECT RAISE(ABORT,'批次谱系账本事件不可修改');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_lineage_events_no_delete
+BEFORE DELETE ON lot_lineage_events
+BEGIN
+    SELECT RAISE(ABORT,'批次谱系账本事件不可删除');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_lineage_components_no_update
+BEFORE UPDATE ON lot_lineage_components
+BEGIN
+    SELECT RAISE(ABORT,'批次谱系账本分装记录不可修改');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_lineage_components_no_delete
+BEFORE DELETE ON lot_lineage_components
+BEGIN
+    SELECT RAISE(ABORT,'批次谱系账本分装记录不可删除');
+END;
 CREATE TABLE IF NOT EXISTS lot_holds (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,
@@ -468,10 +513,43 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _migrate_movement_lineage_column(connection: sqlite3.Connection) -> None:
+    """旧库的 lot_movements 没有 lineage_event_id 列且 CHECK 不含分装/合并，按 12 步表重建方式升级。"""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(lot_movements)").fetchall()}
+    if "lineage_event_id" in columns:
+        return
+    connection.executescript(
+        """
+        CREATE TABLE lot_movements_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,
+            placement_id INTEGER REFERENCES lot_placements(id),
+            movement_type TEXT NOT NULL CHECK(movement_type IN ('入库','移库','取样','领用','归还','报废','盘点调整','分装','合并')),
+            quantity_grams REAL NOT NULL,
+            from_location_id INTEGER REFERENCES storage_locations(id),
+            to_location_id INTEGER REFERENCES storage_locations(id),
+            lineage_event_id INTEGER REFERENCES lot_lineage_events(id) ON DELETE RESTRICT,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            actor TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO lot_movements_new(id,lot_id,placement_id,movement_type,quantity_grams,from_location_id,
+            to_location_id,idempotency_key,actor,reason,created_at)
+        SELECT id,lot_id,placement_id,movement_type,quantity_grams,from_location_id,to_location_id,
+            idempotency_key,actor,reason,created_at FROM lot_movements;
+        DROP TABLE lot_movements;
+        ALTER TABLE lot_movements_new RENAME TO lot_movements;
+        CREATE INDEX IF NOT EXISTS idx_movements_lot ON lot_movements(lot_id,id);
+        """
+    )
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _migrate_movement_lineage_column(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

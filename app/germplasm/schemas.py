@@ -181,6 +181,51 @@ class HoldRelease(BaseModel):
     actor: str = Field(min_length=1, max_length=100)
 
 
+class SplitTarget(BaseModel):
+    lot_no: str = Field(min_length=3, max_length=60)
+    weight_grams: float = Field(gt=0, le=10_000_000)
+    moisture_percent: float | None = Field(default=None, ge=0, le=100)
+    sealed_on: date | None = None
+
+    @field_validator("lot_no")
+    @classmethod
+    def normalize_lot_no(cls, value: str) -> str:
+        return value.strip().upper()
+
+
+class SplitCreate(BaseModel):
+    source_lot_id: int = Field(gt=0)
+    targets: list[SplitTarget] = Field(min_length=1, max_length=500)
+    idempotency_key: str = Field(min_length=8, max_length=100)
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(default="", max_length=300)
+
+
+class MergeInput(BaseModel):
+    lot_id: int = Field(gt=0)
+    weight_grams: float = Field(gt=0, le=10_000_000)
+
+
+class MergeResult(BaseModel):
+    lot_no: str = Field(min_length=3, max_length=60)
+    moisture_percent: float | None = Field(default=None, ge=0, le=100)
+    sealed_on: date | None = None
+    created_by: str = Field(default="保管员", min_length=1, max_length=100)
+
+    @field_validator("lot_no")
+    @classmethod
+    def normalize_lot_no(cls, value: str) -> str:
+        return value.strip().upper()
+
+
+class MergeCreate(BaseModel):
+    inputs: list[MergeInput] = Field(min_length=2, max_length=500)
+    result: MergeResult
+    idempotency_key: str = Field(min_length=8, max_length=100)
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(default="", max_length=300)
+
+
 class ProtocolCreate(BaseModel):
     protocol_code: str = Field(min_length=2, max_length=40)
     crop_name: str = Field(min_length=1, max_length=100)

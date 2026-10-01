@@ -224,7 +224,8 @@ class InventoryService:
     def reconcile(self, lot_id: int) -> dict[str, Any]:
         lot = self.repository.require_lot(lot_id)
         movement_total = float(self.connection.execute(
-            "SELECT COALESCE(SUM(quantity_grams),0) FROM lot_movements WHERE lot_id=? AND movement_type IN ('取样','领用','报废','归还','盘点调整')",
+            "SELECT COALESCE(SUM(quantity_grams),0) FROM lot_movements WHERE lot_id=? "
+            "AND movement_type IN ('取样','领用','报废','归还','盘点调整','分装','合并')",
             (lot_id,),
         ).fetchone()[0])
         expected_available = round(float(lot["initial_weight_grams"]) + movement_total, 6)

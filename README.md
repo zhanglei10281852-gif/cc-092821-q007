@@ -46,9 +46,25 @@ python -m app.cli demo
 
 - `app/germplasm/accessions.py` 管理来源、资源档案、护照信息与接收状态。
 - `app/germplasm/inventory.py` 管理批次、库位容量、容器摆放、移动、领用和冻结。
+- `app/germplasm/lineage.py` 管理不可变批次谱系账本：分装与合并、上下游追溯和重量守恒检查。
 - `app/germplasm/viability.py` 管理检测规程、取样、重复计数、活力结果与复检日程。
 - `app/germplasm/quality.py` 管理温湿度读数、偏离告警和种质发放审批。
 - `app/api`、`app/services` 和 `app/repositories` 提供身份、权限、审计、后台作业及维护能力。
+
+## 批次谱系
+
+- 分装 `POST /api/germplasm/lineage/splits`：一次请求给出多个目标批次及重量，服务端在同一事务内
+  按目标重量之和一次性扣减来源可用量（乐观版本锁守卫），并为每个目标建立子批次；总量超限、编号
+  冲突、来源冻结等任一目标失败都会整体回滚。
+- 合并 `POST /api/germplasm/lineage/merges`：只允许同资源、同处理条件、同收获年份、无质量冻结、
+  最近一次活力结果处于同一风险档（未检测批次互不混并）的批次合并，任一输入失败整次回滚。
+- 谱系事件（`lot_lineage_events`）与组件（`lot_lineage_components`）只追加，数据库触发器禁止
+  UPDATE/DELETE；被谱系引用的历史批次（已领用、已用于检测、已耗尽）不能删除，仍可追溯。
+- 业务键重试直接返回原谱系事件（响应中 `replayed=true`），不会重复扣减；版本冲突时扣减语句
+  0 行命中，重量不可能增减两次。
+- `GET /api/germplasm/lots/{lot_id}/lineage` 向上还原来源（`ancestors`）、向下汇总去向
+  （`descendants`）；`GET /api/germplasm/lots/{lot_id}/conservation` 用谱系重量守恒和库存流水
+  交叉核对，返回 `balanced` 与具体异常（事件失衡、可用量漂移、流水与谱系不对应等）。
 
 ## 一致性约定
 
